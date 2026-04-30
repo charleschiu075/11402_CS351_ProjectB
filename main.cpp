@@ -1,115 +1,155 @@
-// main.cpp — Demo driver for csvdb
-// BUILD: g++ -std=c++17 -O2 main.cpp -o csvdb
-#include "csvdb.hpp"
-#include <cassert>
+#include "Tokenizer.hpp"
+#include "Parser.hpp"
+#include "Database.hpp"
+#include "Executor.hpp"
+#include "Formatter.hpp"
+
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <variant>
 
 using namespace csvdb;
 
-// --- Unit tests for the CSV parser ---
-void test_parser() {
-    CsvParser p;
+namespace {
 
-    // Basic
-    auto r = p.parse_row("a,b,c");
-    assert(r.size() == 3 && r[0] == "a" && r[2] == "c");
-
-    // Quoted fields with embedded commas
-    r = p.parse_row("\"hello, world\",b,c");
-    assert(r[0] == "hello, world");
-
-    // Escaped quotes
-    r = p.parse_row("\"she said \"\"hi\"\"\",b");
-    assert(r[0] == "she said \"hi\"");
-
-    // Embedded newlines (via stream)
-    std::istringstream ss("name,bio\nAlice,\"line1\nline2\"\nBob,simple");
-    auto rows = p.parse_stream(ss);
-    assert(rows.size() == 3);           // header + 2 data rows
-    assert(rows[1][1] == "line1\nline2");
-
-    // Empty fields
-    r = p.parse_row(",,,");
-    assert(r.size() == 4);
-    for (auto& f : r) assert(f.empty());
-
-    std::cout << "Parser tests passed.\n";
+std::string trim(const std::string& s) {
+    size_t a = s.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos) return "";
+    size_t b = s.find_last_not_of(" \t\r\n");
+    return s.substr(a, b - a + 1);
 }
 
-// --- Functional demo ---
-void demo() {
-    // Sample dataset: employees
-    const char* csv = R"(id,name,department,salary,city
-1,Alice,Engineering,120000,Seattle
-2,Bob,Engineering,115000,Portland
-3,Carol,Marketing,95000,Seattle
-4,Dave,Marketing,88000,Denver
-5,Eve,Engineering,130000,Seattle
-6,Frank,Sales,78000,Portland
-7,Grace,Engineering,125000,Denver
-8,Heidi,Sales,82000,Seattle
-9,Ivan,Marketing,91000,Portland
-10,Judy,Engineering,118000,Seattle)";
+std::vector<std::string> splitWhitespace(const std::string& s) {
+    std::vector<std::string> out;
+    std::istringstream is(s);
+    std::string tok;
+    while (is >> tok) out.push_back(tok);
+    return out;
+}
 
+void printHelp() {
+    std::cout <<
+        "Commands:\n"
+        "  .load <path> <table>      load a CSV (row 0 = headers) into <table>\n"
+        "  .tables                   list tables\n"
+        "  .schema <table>           show columns + indices for <table>\n"
+        "  .mode table|csv           set output format (default: table)\n"
+        "  .help                     this message\n"
+        "  .exit                     quit\n"
+        "SQL:\n"
+        "  SELECT <cols|*> FROM <table> [WHERE <pred>] ;\n"
+        "  CREATE INDEX ON <table>(<col>) ;\n"
+        "Predicates: col <op> 'literal' | col IS [NOT] NULL ; combine with AND / OR ; ()\n"
+        "Operators:  =  !=  <>  <  <=  >  >=\n";
+}
+
+bool handleDot(const std::string& line, Database& db, std::string& mode) {
+    auto parts = splitWhitespace(line);
+    if (parts.empty()) return true;
+    const std::string& cmd = parts[0];
+    if (cmd == ".exit" || cmd == ".quit") return false;
+    if (cmd == ".help")  { printHelp(); return true; }
+    if (cmd == ".mode") {
+        if (parts.size() != 2 || (parts[1] != "table" && parts[1] != "csv")) {
+            std::cout << "usage: .mode table|csv\n"; return true;
+        }
+        mode = parts[1];
+        std::cout << "mode = " << mode << "\n";
+        return true;
+    }
+    if (cmd == ".load") {
+        if (parts.size() != 3) { std::cout << "usage: .load <path> <table>\n"; return true; }
+        try {
+            // .load <path> <table> ; Database::load(table_name, csv_path)
+            db.load(parts[2], parts[1]);
+        } catch (const std::exception& e) { std::cout << "error: " << e.what() << "\n"; }
+        return true;
+    }
+    if (cmd == ".tables") {
+        for (const auto& kv : db.tables()) std::cout << kv.first << "\n";
+        return true;
+    }
+    if (cmd == ".schema") {
+        if (parts.size() != 2) { std::cout << "usage: .schema <table>\n"; return true; }
+        try {
+            const Table& t = db.table(parts[1]);
+            std::cout << "table " << parts[1] << " (" << t.rows.size() << " rows)\n";
+            for (const auto& h : t.headers) {
+                std::cout << "  " << h;
+                if (t.indices.count(h)) std::cout << "  [indexed]";
+                std::cout << "\n";
+            }
+        } catch (const std::exception& e) { std::cout << "error: " << e.what() << "\n"; }
+        return true;
+    }
+    std::cout << "unknown command: " << cmd << " (try .help)\n";
+    return true;
+}
+
+void runStatement(const std::string& sql, Database& db, const std::string& mode) {
+    try {
+        Tokenizer tk(sql);
+        auto tokens = tk.tokenize();
+        Parser p(std::move(tokens));
+        Statement st = p.parseStatement();
+        Executor ex(db);
+        if (std::holds_alternative<SelectStmt>(st)) {
+            ResultSet rs = ex.executeSelect(std::get<SelectStmt>(st));
+            if (mode == "csv") Formatter::printCsv(std::cout, rs);
+            else               Formatter::printTable(std::cout, rs);
+        } else {
+            ex.executeCreateIndex(std::get<CreateIndexStmt>(st));
+            std::cout << "OK\n";
+        }
+    } catch (const std::exception& e) {
+        std::cout << "error: " << e.what() << "\n";
+    }
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
     Database db;
-    db.load_csv_string(csv);
+    std::string mode = "table";
 
-    std::cout << "\n=== Query 1: SELECT * WHERE department = 'Engineering' ===\n";
-    db.execute("SELECT * WHERE department = 'Engineering'").print();
-
-    std::cout << "\n=== Query 2: Top earners (salary > 100000, ordered) ===\n";
-    db.execute("SELECT name, salary, city WHERE salary > 100000 ORDER BY salary DESC").print();
-
-    std::cout << "\n=== Query 3: Full scan — Seattle employees ===\n";
-    db.execute("SELECT name, department WHERE city = 'Seattle'").print();
-
-    // Now create an index and re-run
-    std::cout << "\n=== Creating index on 'city' ===\n";
-    db.create_index("city");
-
-    std::cout << "\n=== Query 4: Index scan — Seattle employees ===\n";
-    db.execute("SELECT name, department WHERE city = 'Seattle'").print();
-
-    std::cout << "\n=== Query 5: Multi-predicate — Engineering in Seattle ===\n";
-    db.create_index("department");
-    db.execute("SELECT name, salary WHERE department = 'Engineering' AND city = 'Seattle' ORDER BY salary DESC").print();
-
-    std::cout << "\n=== Query 6: LIMIT ===\n";
-    db.execute("SELECT * ORDER BY salary DESC LIMIT 3").print();
-}
-
-// --- Benchmark: index vs full scan ---
-void benchmark() {
-    // Generate a larger dataset
-    std::ostringstream oss;
-    oss << "id,category,value\n";
-    const char* cats[] = {"A", "B", "C", "D", "E"};
-    for (int i = 0; i < 100000; ++i) {
-        oss << i << "," << cats[i % 5] << "," << (i * 7 % 1000) << "\n";
+    // Optional: preload tables from CLI: --load path:name
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a.rfind("--load=", 0) == 0) {
+            std::string spec = a.substr(7);
+            auto colon = spec.find(':');
+            if (colon == std::string::npos) {
+                std::cerr << "bad --load spec, expected path:name\n"; return 1;
+            }
+            try { db.load(spec.substr(colon+1), spec.substr(0, colon)); }
+            catch (const std::exception& e) { std::cerr << "error: " << e.what() << "\n"; return 1; }
+        }
     }
 
-    Database db;
-    db.load_csv_string(oss.str());
+    std::cout << "csvdb v0.1  (.help for commands)\n";
+    std::string buf;
+    while (true) {
+        std::cout << (buf.empty() ? "csvdb> " : "  ...> ") << std::flush;
+        std::string line;
+        if (!std::getline(std::cin, line)) { std::cout << "\n"; break; }
 
-    std::cout << "\n=== Benchmark: 100K rows ===\n";
-
-    // Full scan
-    auto r1 = db.execute("SELECT * WHERE category = 'C'");
-    std::cout << "Full scan:  " << r1.exec_time_ms << " ms, "
-              << r1.rows.size() << " rows  [" << r1.plan << "]\n";
-
-    // With index
-    db.create_index("category");
-    auto r2 = db.execute("SELECT * WHERE category = 'C'");
-    std::cout << "Index scan: " << r2.exec_time_ms << " ms, "
-              << r2.rows.size() << " rows  [" << r2.plan << "]\n";
-
-    double speedup = r1.exec_time_ms / r2.exec_time_ms;
-    std::cout << "Speedup: " << std::fixed << std::setprecision(1) << speedup << "x\n";
-}
-
-int main() {
-    test_parser();
-    demo();
-    benchmark();
+        std::string trimmed = trim(line);
+        if (buf.empty() && !trimmed.empty() && trimmed[0] == '.') {
+            if (!handleDot(trimmed, db, mode)) break;
+            continue;
+        }
+        if (!buf.empty()) buf += " ";
+        buf += line;
+        // statements terminate on ';'
+        size_t semi = buf.find(';');
+        if (semi != std::string::npos) {
+            std::string stmt = buf.substr(0, semi + 1);
+            std::string rest = buf.substr(semi + 1);
+            std::string s = trim(stmt);
+            if (!s.empty() && s != ";") runStatement(s, db, mode);
+            buf = trim(rest);
+        }
+    }
     return 0;
 }
