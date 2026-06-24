@@ -1,0 +1,5 @@
+build/
+*.o
+csvdb
+csvdb_tests
+tests

@@ -16,9 +16,11 @@ Or directly:
 g++ -std=c++17 -O2 -Wall -Wextra -Isrc src/main.cpp -o csvdb
 ```
 
-Tests:
+Tests (standalone, or via CMake/CTest):
 ```
 g++ -std=c++17 -O2 -Wall -Wextra -Isrc tests/test_main.cpp -o tests && ./tests
+# or, from the build dir:
+ctest --output-on-failure
 ```
 
 ## REPL commands
@@ -58,6 +60,16 @@ Database   -> Tables         (in-memory, hash-based column lookup, hash-based in
 Executor   -> ResultSet      (index-aware planner for top-level AND chains)
 Formatter  -> stdout         (aligned table or CSV output)
 ```
+
+### Predicate binding
+
+Before scanning, the executor walks the `WHERE` tree once to **bind** every
+column reference: it validates that the column exists (erroring early on a typo)
+and caches the resolved column position on the predicate node. Per-row
+evaluation then indexes directly by position instead of doing an
+`unordered_map` string-hash lookup for every column on every row. For an
+*N*-row full scan against a *k*-predicate filter this turns *N×k* hash lookups
+into *k* (one per predicate, done once at bind time).
 
 ### Index planner
 

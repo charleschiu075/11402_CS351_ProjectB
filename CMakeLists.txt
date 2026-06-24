@@ -15,3 +15,8 @@ endif()
 
 add_executable(csvdb src/main.cpp)
 target_include_directories(csvdb PRIVATE src)
+
+enable_testing()
+add_executable(csvdb_tests tests/test_main.cpp)
+target_include_directories(csvdb_tests PRIVATE src)
+add_test(NAME csvdb_tests COMMAND csvdb_tests)
