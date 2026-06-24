@@ -35,8 +35,11 @@ public:
             }
         }
 
-        // Validate columns referenced in WHERE before scanning
-        if (s.where) validateColumns(*s.where, t);
+        // Bind columns referenced in WHERE before scanning: validates that each
+        // column exists (throws if not) and caches its position so per-row
+        // evaluation does no hash lookups. s.where is const, but the pointed-to
+        // Predicate nodes are mutable through unique_ptr.
+        if (s.where) bindColumns(*s.where, t);
 
         // Plan: try to find an indexable equality conjunct in a top-level AND chain
         std::vector<size_t> candidates;
@@ -70,8 +73,11 @@ public:
         };
 
         if (used_index) {
+            out.rows.reserve(candidates.size());
             for (size_t r : candidates) eval_and_emit(r);
         } else {
+            // No filter => every row is emitted; reserve to avoid regrowth.
+            if (!s.where) out.rows.reserve(t.rows.size());
             for (size_t r = 0; r < t.rows.size(); ++r) eval_and_emit(r);
         }
         return out;
@@ -94,17 +100,17 @@ private:
         }
     }
 
-    static void validateColumns(const Predicate& p, const Table& t) {
+    static void bindColumns(Predicate& p, const Table& t) {
         switch (p.kind) {
             case PredKind::Cmp:
             case PredKind::IsNull:
             case PredKind::IsNotNull:
-                (void)t.col(p.column); // throws if missing
+                p.col_idx = t.col(p.column); // throws if missing; cached for eval
                 break;
             case PredKind::And:
             case PredKind::Or:
-                if (p.left)  validateColumns(*p.left, t);
-                if (p.right) validateColumns(*p.right, t);
+                if (p.left)  bindColumns(*p.left, t);
+                if (p.right) bindColumns(*p.right, t);
                 break;
         }
     }
@@ -116,11 +122,11 @@ private:
             case PredKind::Or:
                 return evalPredicate(*p.left, t, r) || evalPredicate(*p.right, t, r);
             case PredKind::IsNull:
-                return !t.rows[r][t.col(p.column)].has_value();
+                return !t.rows[r][p.col_idx].has_value();
             case PredKind::IsNotNull:
-                return  t.rows[r][t.col(p.column)].has_value();
+                return  t.rows[r][p.col_idx].has_value();
             case PredKind::Cmp: {
-                const Cell& v = t.rows[r][t.col(p.column)];
+                const Cell& v = t.rows[r][p.col_idx];
                 if (!v.has_value()) return false; // NULL never satisfies a comparison
                 int cmp = v->compare(p.literal);  // lexicographic
                 switch (p.op) {

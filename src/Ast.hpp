@@ -24,6 +24,10 @@ struct Predicate {
     std::string column;
     CmpOp op = CmpOp::Eq;
     std::string literal;
+    // Resolved column position, filled in by the executor's bind pass so that
+    // per-row evaluation avoids a hash lookup on every row. Valid for leaf
+    // predicates (Cmp / IsNull / IsNotNull) once bound.
+    size_t col_idx = 0;
     // And / Or
     PredPtr left;
     PredPtr right;
